@@ -86,6 +86,10 @@ runs/*
 *.fai
 *.fna.gz
 
+# Hydra outputs
+**/outputs/*
+**/.hydra/*
+
 # expression task
 downstream_tasks/expression_prediction/intervals/*
 downstream_tasks/expression_prediction/runs/*
