@@ -1,9 +1,9 @@
-from .model import ExpressionCountsModel, ExpressionCountsModelOutput
+from .model import CaduceusExpressionCountsModel, ExpressionCountsModelOutput
 from .losses import ExpressionCountsLoss, CellTypeLoss
 
 __all__ = [
     "ExpressionCountsModel",
-    "ExpressionCountsModelOutput",
+    "CaduceusExpressionCountsModel",
     "ExpressionCountsLoss",
     "CellTypeLoss",
 ]

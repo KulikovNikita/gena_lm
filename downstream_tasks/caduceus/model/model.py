@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 from typing import Optional
 
-from transformers import AutoModel
+from transformers import AutoModel, PreTrainedModel
 from transformers.models.bert.modeling_bert import BertPreTrainedModel, BertModel
 from transformers.modeling_outputs import TokenClassifierOutput
 
@@ -34,7 +34,66 @@ class ExpressionCountsModelOutput(TokenClassifierOutput):
     deviation_loss: Optional[torch.FloatTensor] = None
 
 
-class ExpressionCountsModel(BertPreTrainedModel):
+class CrossLayer(torch.nn.Module):
+    def __init__(self, hidden_size, desc_size, num_heads = 1, activation = torch.nn.Identity()):
+        super().__init__()
+
+        half_size = hidden_size // 2
+        self.attn_fwd = torch.nn.MultiheadAttention(
+            embed_dim = half_size,
+            num_heads = num_heads,
+            kdim = desc_size,
+            vdim = desc_size,
+            batch_first = True,
+            bias = False,
+        )
+        self.attn_bck = torch.nn.MultiheadAttention(
+            embed_dim = half_size,
+            num_heads = num_heads,
+            kdim = desc_size,
+            vdim = desc_size,
+            batch_first = True,
+            bias = False,
+        )
+
+        self.fwd_out = torch.nn.Linear(hidden_size, half_size, bias = False)
+        self.bck_out = torch.nn.Linear(hidden_size, half_size, bias = False)
+
+        self.norm = torch.nn.RMSNorm(half_size)
+        self.activ = activation
+
+    def forward(self, hidden_states, description) -> torch.Tensor:
+        def flip(x):
+            return x.flip(dims=(-2, -1))
+
+        hidden_size = hidden_states.shape[-1]
+        fwd_hidden = hidden_states[..., :(hidden_size // 2)]
+        bck_hidden = flip(hidden_states[..., (hidden_size // 2):])
+        attn_fwd, _ = self.attn_fwd(fwd_hidden, description, description)
+        attn_bck, _ = self.attn_bck(bck_hidden, description, description) 
+        attn_out = self.activ(torch.cat((attn_fwd, attn_bck), dim = -1))
+
+        fwd_out = self.norm(self.fwd_out(attn_out) + fwd_hidden)
+        bck_out = self.norm(self.bck_out(attn_out) + bck_hidden)
+        return torch.cat((fwd_out, flip(bck_out)), dim = -1)
+
+class FusedLayer(torch.nn.Module):
+    def __init__(self, caduceus, xattention):
+        super().__init__()
+
+        self.caduceus = caduceus
+        self.xattention = xattention
+
+    def forward(self, hidden_states, desc_vectors, residual = None):
+        hidden_states, residual = self.caduceus(
+            hidden_states, residual, inference_params=None
+        )
+        hidden_states = self.xattention(
+            hidden_states, desc_vectors
+        )
+        return (hidden_states, residual)
+
+class CaduceusExpressionCountsModel(PreTrainedModel):
     """
     Размерности:
       - input_ids: (B, seq_len)
@@ -61,42 +120,44 @@ class ExpressionCountsModel(BertPreTrainedModel):
         losses=None,
         activation=nn.Identity(),
         hidden_size_desc=768,
-        hidden_ff=1024,
-        num_encoder_layers=3,
+        feature_count = 16,
         nhead=8,
         weight=1.0,
-        text_model=None,
         hf_model_name: str = "kuleshov-group/caduceus-ph_seqlen-131k_d_model-256_n_layer-16",
     ):
-        print(config)
         config.initializer_range = 0.02
+
         super().__init__(config)
         self.config = config
         self.hidden_size = config.d_model
         self.hidden_size_desc = hidden_size_desc
 
-        self.caduceus = AutoModel.from_pretrained(hf_model_name, trust_remote_code=True)
+        caduceus = AutoModel.from_pretrained(hf_model_name, trust_remote_code=True)
 
-        if text_model is not None:
-            self.desc_fc = text_model
-        else:
-            # 2) MLP для desc_vectors
-            self.desc_fc = nn.Sequential(
-                nn.Linear(self.hidden_size_desc, self.hidden_size),
-                nn.LeakyReLU(),
-                nn.Linear(self.hidden_size, self.hidden_size),
+        self.embeddings = caduceus.backbone.embeddings
+
+        self.norm_f = caduceus.backbone.norm_f
+
+        raw_layers = caduceus.backbone.layers
+        cross_layers = torch.nn.ModuleList([
+            CrossLayer(
+                hidden_size = self.hidden_size,
+                desc_size = hidden_size_desc,
+                activation = activation,
+                num_heads = nhead,
             )
+            for _ in range(len(raw_layers))
+        ])
+        self.layers = torch.nn.ModuleList([
+            FusedLayer(raw_layer, cross_layer)
+            for raw_layer, cross_layer in zip(raw_layers, cross_layers)
+        ])
 
-        # 3) Encoder
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=self.hidden_size,
-            nhead=nhead,
-            dim_feedforward=hidden_ff,
-            batch_first=True,
+        self.feature_count = feature_count
+        self.feature_weights: torch.nn.Parameter = torch.nn.Parameter(
+            torch.randn(self.feature_count, self.hidden_size_desc)
         )
-        self.transformer_encoder = nn.TransformerEncoder(
-            encoder_layer, num_layers=num_encoder_layers
-        )
+        torch.nn.init.orthogonal_(self.feature_weights)
 
         # 4) Classifier
         self.classifier = nn.Linear(self.hidden_size, 1)
@@ -107,6 +168,49 @@ class ExpressionCountsModel(BertPreTrainedModel):
         self.losses = losses
 
         self.post_init()
+
+    def pooling(self, hidden_states) -> torch.Tensor:
+        return torch.mean(hidden_states, dim = -2)
+
+    def forward_batch(self, hidden_states, desc_vectors) -> torch.Tensor:
+        # hidden_states: B*N, seq_len, hidden_size
+        # desc_vectors: B*N, desc_len, desc_size
+        residual = None
+        for layer in self.layers:
+            # TODO: Add support for gradient checkpointing
+            hidden_states, residual = layer(
+                hidden_states, desc_vectors, residual
+            )
+
+        return hidden_states
+
+    def forward_model(self, 
+                      desc_vectors,
+                      input_ids = None,
+                      inputs_embeds = None, 
+                      **kwargs):
+        # desc_vectors: batch_size, desc_len, desc_size
+        # hidden_states: batch_size, seq_len, hidden_size
+        if inputs_embeds is not None:
+            hidden_states = inputs_embeds
+        else:
+            hidden_states = self.embeddings(input_ids)
+
+        h_batch_size, seq_len, h_hidden_size = hidden_states.shape
+        d_batch_size, desc_len, d_hidden_size = desc_vectors.shape
+        assert h_batch_size == d_batch_size
+
+        all_hidden_states = hidden_states.unsqueeze(1).expand(-1, desc_len, -1, -1) \
+            .reshape(h_batch_size * desc_len, seq_len, h_hidden_size)
+        all_desc_states = desc_vectors.unsqueeze(2).expand(-1, -1, self.feature_count, -1) \
+            .reshape(d_batch_size * desc_len, self.feature_count, d_hidden_size)
+        all_desc_states = all_desc_states + self.feature_weights.unsqueeze(0) \
+            .expand(d_batch_size * desc_len, self.feature_count, d_hidden_size)
+
+        all_hidden_states = self.forward_batch(all_hidden_states, all_desc_states)
+        logits = self.classifier(all_hidden_states)
+        logits = self.activation(logits)
+        return (all_hidden_states, logits)
 
     def forward(
         self,
@@ -125,59 +229,10 @@ class ExpressionCountsModel(BertPreTrainedModel):
             return_dict if return_dict is not None else self.config.use_return_dict
         )
 
-        # Прогоняем через GENA
-        caduceus_outputs = self.caduceus(
-            input_ids=input_ids,
-            inputs_embeds=inputs_embeds,
-            output_hidden_states=output_hidden_states,
-            return_dict=True,
-        )
-        # Notaton:
-        # B - batch size
-        # N - number of cell types (a.k.a experiment descriptors)
-        # seq_len - sequence length (number of tokens in the input sequence)
-        # hidden_size - hidden size
-
-        # (B, seq_len, hidden_size)
-        sequence_output = caduceus_outputs.last_hidden_state
-        B, seq_len, hidden_size = sequence_output.shape  # (B, seq_len, hidden_size)
-
-        # Assuming that desc_vectors.shape -> (B, N, hidden_size_desc), where N - number of cell types (a.k.a experiment descriptors)
-        N = desc_vectors.shape[1]
-
-        # Расширяем выход
-        # (B, seq_len, hidden_size) -> (B, N, seq_len, hidden_size)
-        seq_out_expanded = sequence_output.unsqueeze(1).expand(
-            -1, N, -1, -1
-        )  # B, N, seq_len, hidden_size
-
-        # Прогоняем desc_vectors через MLP
-        # (B, N, hidden_size) -> (B*N, hidden_size)
-        desc_vectors_2d = desc_vectors.reshape(B * N, desc_vectors.shape[-1])
-        desc_fc_output = self.desc_fc(desc_vectors_2d)  # (B*N, hidden_size)
-        # (B*N, hidden_size) -> (B, N, hidden_size)
-        desc_fc_output = desc_fc_output.reshape(B, N, hidden_size)
-
-        # Складываем desc_vectors с CLS
-        # CLS-токен — seq_out_expanded[:, :, 0, :]  (B, N, hidden_size)
-        seq_out_expanded = seq_out_expanded.contiguous()
-        seq_out_expanded[:, :, 0, :] = (
-            seq_out_expanded[:, :, 0, :].clone() + desc_fc_output
+        hidden_states, logits = self.forward_model(
+            desc_vectors, input_ids, inputs_embeds
         )
 
-        # (B, N, seq_len, hidden_size) -> (B*N, seq_len, hidden_size)
-        seq_out_flat = seq_out_expanded.reshape(B * N, seq_len, hidden_size)
-
-        # Прогоняем через Encoder
-        encoder_output = self.transformer_encoder(
-            seq_out_flat
-        )  # (B*N, seq_len, hidden_size)
-
-        # Classifier -> (B*N, seq_len, 1)
-        logits = self.classifier(encoder_output)
-        logits = self.activation(logits)
-
-        # Loss
         losses = dict()
         if self.losses:
             losses = self.losses(
@@ -186,12 +241,14 @@ class ExpressionCountsModel(BertPreTrainedModel):
                 labels_mask=labels_mask,
             )
 
+        #print(losses)
+
         if not return_dict:
             return (losses["loss"], logits)
 
         output = ExpressionCountsModelOutput(
             logits=logits,
-            hidden_states=sequence_output,
+            hidden_states=hidden_states,
             loss=losses.get("loss", None),
             cls_loss=losses.get("cls_loss", None),
             mean_loss=losses.get("mean_loss", None),

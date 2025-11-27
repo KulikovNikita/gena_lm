@@ -84,6 +84,8 @@ class ExpressionCountsLoss(nn.Module):
 
         #print(f"{logits.shape=}, {labels.shape=}, {labels_mask.shape=}")
 
+        #print(f"{logits=}, {labels=}, {labels_mask=}")
+
         loss = None
         if labels is not None:
             B, seq_len, N = labels.shape
@@ -104,6 +106,8 @@ class ExpressionCountsLoss(nn.Module):
 
             labels_reshaped = labels.permute(0, 2, 1).reshape(B*N, seq_len, 1).to(logits.device)
             labels_mask_reshaped = labels_mask.permute(0, 2, 1).reshape(B*N, seq_len, 1).to(logits.device)
+
+            #print("Here")
 
             # loss
             # Cчитаем общий лосс
